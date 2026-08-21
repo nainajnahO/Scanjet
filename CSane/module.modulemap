@@ -1,0 +1,6 @@
+// Exposes Homebrew's libsane to Swift as `import CSane`.
+module CSane [system] {
+    header "/opt/homebrew/include/sane/sane.h"
+    link "sane"
+    export *
+}
