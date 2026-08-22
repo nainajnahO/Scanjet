@@ -508,7 +508,9 @@ final class ScannerModel {
         sensorTask = Task {
             var held: Set<String> = []
             while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(500))
+                // Sleep only throws on cancellation; leave before touching the scanner, which
+                // shutdown() is about to close.
+                guard (try? await Task.sleep(for: .milliseconds(500))) != nil else { return }
                 guard canScan else { continue }
                 let states: [String: Bool]
                 do {
