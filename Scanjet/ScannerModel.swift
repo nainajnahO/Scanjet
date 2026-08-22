@@ -6,7 +6,10 @@ import UniformTypeIdentifiers
 @MainActor
 @Observable
 final class ScannerModel {
-    enum ScanKind: Sendable { case preview, final }
+    enum ScanKind: String, Sendable {
+        case preview = "Preview"
+        case final = "Scan"
+    }
 
     enum CanvasMode: String, CaseIterable, Identifiable {
         case preview = "Preview"
@@ -43,47 +46,63 @@ final class ScannerModel {
         var id: String { name }
     }
 
+    /// Option names are hp3900's; a setting whose option the connected backend lacks is skipped.
     static let presets: [Preset] = [
         Preset(name: "Document", settings: [
             ("source", .string("Flatbed")), ("mode", .string("Color")), ("resolution", .int(300)), ("depth", .int(8)),
-            ("opt_nogamma", .bool(false)), ("opt_nowshading", .bool(false)), ("opt_realdepth", .bool(false)),
+            ("opt_nogamma", .bool(false)), ("opt_nowshading", .bool(false)),
         ]),
         Preset(name: "Photo", settings: [
             ("source", .string("Flatbed")), ("mode", .string("Color")), ("resolution", .int(600)), ("depth", .int(16)),
-            ("opt_nogamma", .bool(false)), ("opt_nowshading", .bool(false)), ("opt_realdepth", .bool(false)),
+            ("opt_nogamma", .bool(false)), ("opt_nowshading", .bool(false)),
         ]),
         Preset(name: "Negative film", settings: [
             ("source", .string("Negative")), ("mode", .string("Color")), ("resolution", .int(2400)), ("depth", .int(16)),
-            ("opt_nogamma", .bool(false)), ("opt_nowshading", .bool(false)), ("opt_realdepth", .bool(false)),
+            ("opt_nogamma", .bool(false)), ("opt_nowshading", .bool(false)),
         ]),
         Preset(name: "Slide", settings: [
             ("source", .string("Slide")), ("mode", .string("Color")), ("resolution", .int(2400)), ("depth", .int(16)),
-            ("opt_nogamma", .bool(false)), ("opt_nowshading", .bool(false)), ("opt_realdepth", .bool(false)),
+            ("opt_nogamma", .bool(false)), ("opt_nowshading", .bool(false)),
         ]),
-        // What the sensor saw: no gamma curve, no white-shading correction, true 16-bit samples.
+        // What the sensor saw: no gamma curve, no white-shading correction, 16-bit samples.
         Preset(name: "Raw sensor", settings: [
             ("mode", .string("Color")), ("depth", .int(16)),
-            ("opt_nogamma", .bool(true)), ("opt_nowshading", .bool(true)), ("opt_realdepth", .bool(true)),
+            ("opt_nogamma", .bool(true)), ("opt_nowshading", .bool(true)),
         ]),
     ]
 
     private(set) var activity: Activity = .disconnected
     private(set) var deviceName = ""
-    private(set) var options: [ScanOption] = []
+    private(set) var options: [ScanOption] = [] {
+        didSet {
+            // Switching between flatbed and film adapter changes the bed; the preview no longer
+            // shows what a drag would select.
+            if previewImage != nil, bedSize != previewBedSize {
+                previewImage = nil
+                note("Preview discarded: the scan bed changed size")
+            }
+        }
+    }
     private(set) var errorMessage: String?
     private(set) var log: [LogEntry] = []
 
     /// Low-resolution scan of the whole bed, used to pick the scan area.
     private(set) var previewImage: CGImage?
-    /// The last full scan and what the canvas shows for it (possibly inverted).
-    private(set) var result: ScanFrame?
+    private var previewBedSize = CGSize.zero
+    /// The last full scan; `resultImage` is a display-sized rendering of it with the toggles applied.
+    private(set) var result: ScanFrame? {
+        didSet { scheduleRender() }
+    }
     private(set) var resultImage: CGImage?
+    /// `result` with the toggles applied, ready for Save; nil while that is being computed.
+    private var processedResult: ScanFrame?
+    private(set) var isProcessing = false
     /// Per-channel levels; switched on automatically for film sources, see `scan()`.
     var balanceResult = false {
-        didSet { refreshResultImage() }
+        didSet { scheduleRender() }
     }
     var invertResult = false {
-        didSet { refreshResultImage() }
+        didSet { scheduleRender() }
     }
     var showAdvanced = false
     /// Which image the canvas shows; flips automatically when a preview or scan completes.
@@ -92,6 +111,8 @@ final class ScannerModel {
     private let scanner = SaneScanner()
     private let logger = Logger(subsystem: "nainajnahO.Scanjet", category: "scanner")
     private var sensorTask: Task<Void, Never>?
+    private var renderTask: Task<Void, Never>?
+    private var renderScheduled = false
 
     // MARK: Derived state
 
@@ -109,6 +130,7 @@ final class ScannerModel {
         default: false
         }
     }
+    var canSave: Bool { processedResult != nil && !isProcessing }
 
     /// Selection being dragged on the preview, in millimetres. Shown in place of the backend's
     /// values until `setArea` has committed it, so the numbers follow the mouse.
@@ -117,8 +139,8 @@ final class ScannerModel {
     /// Scan area in whole millimetres: the drag in progress, else what the backend has.
     var area: CGRect {
         if let draggingArea { return Self.wholeMillimetres(draggingArea) }
-        let left = intValue("tl-x"), top = intValue("tl-y")
-        let right = intValue("br-x"), bottom = intValue("br-y")
+        let left = number("tl-x"), top = number("tl-y")
+        let right = number("br-x"), bottom = number("br-y")
         return CGRect(x: left, y: top, width: max(right - left, 0), height: max(bottom - top, 0))
     }
 
@@ -129,7 +151,7 @@ final class ScannerModel {
 
     /// Physical size of the glass, from the geometry options' upper limits.
     var bedSize: CGSize {
-        CGSize(width: CGFloat(maxValue("br-x")), height: CGFloat(maxValue("br-y")))
+        CGSize(width: maximum("br-x"), height: maximum("br-y"))
     }
 
     var sections: [Section] {
@@ -141,16 +163,13 @@ final class ScannerModel {
             if !visible.isEmpty { sections.append(Section(title: title, options: visible)) }
             pending = []
         }
-        let live: [String: Int] = draggingArea.map { _ in
-            let area = self.area
-            return ["tl-x": Int(area.minX), "tl-y": Int(area.minY), "br-x": Int(area.maxX), "br-y": Int(area.maxY)]
-        } ?? [:]
+        let live = draggingArea.map { _ in Dictionary(uniqueKeysWithValues: geometrySettings(for: area).map { ($0.name, $0.value) }) } ?? [:]
         for var option in options {
             if option.kind == .group {
                 flush()
                 title = option.title
             } else if option.value != nil || option.kind == .button {
-                if let value = live[option.name] { option.value = .int(value) }
+                if let value = live[option.name] { option.value = value }
                 pending.append(option)
             }
         }
@@ -161,6 +180,7 @@ final class ScannerModel {
     // MARK: Connection
 
     func connect() async {
+        sensorTask?.cancel()
         activity = .connecting
         errorMessage = nil
         do {
@@ -176,17 +196,34 @@ final class ScannerModel {
         }
     }
 
+    /// Stops any scan and releases the scanner. Called when the app quits so the backend gets
+    /// to park the carriage and arm the lamp timer instead of being killed mid-read.
+    func shutdown() async {
+        sensorTask?.cancel()
+        cancel()
+        await scanner.disconnect()
+        activity = .disconnected
+    }
+
+    /// The backend lost the device; behave as if it was never opened until Reconnect.
+    private func lostScanner() async {
+        sensorTask?.cancel()
+        await scanner.disconnect()
+        activity = .disconnected
+        note("Lost contact with the scanner")
+    }
+
     // MARK: Options
 
     func set(_ name: String, to value: OptionValue) {
         Task {
             do {
                 try await scanner.set(name, to: value)
-                options = try await scanner.options()
                 note("\(name) = \(describe(value))")
             } catch {
                 fail("Could not set \(name)", error)
             }
+            await reloadOptions()
         }
     }
 
@@ -194,44 +231,42 @@ final class ScannerModel {
         Task {
             do {
                 try await scanner.press(name)
-                options = try await scanner.options()
                 note("Pressed \(name)")
             } catch {
                 fail("Could not press \(name)", error)
             }
+            await reloadOptions()
         }
     }
 
     func apply(_ preset: Preset) {
+        let available = Set(options.map(\.name))
         Task {
             do {
-                for setting in preset.settings {
+                for setting in preset.settings where available.contains(setting.option) {
                     try await scanner.set(setting.option, to: setting.value)
                 }
-                options = try await scanner.options()
                 note("Applied preset “\(preset.name)”")
             } catch {
                 fail("Could not apply preset “\(preset.name)”", error)
             }
+            await reloadOptions()   // Even after a failure: some settings went through.
         }
     }
 
     func setArea(_ rect: CGRect) {
         let rect = Self.wholeMillimetres(rect)
         draggingArea = rect
+        let settings = geometrySettings(for: rect)
         Task {
             defer { if draggingArea == rect { draggingArea = nil } }   // Unless a new drag has begun.
             do {
-                // Set the origin first so the far edge never has to be below it.
-                try await scanner.set("tl-x", to: .int(Int(rect.minX)))
-                try await scanner.set("tl-y", to: .int(Int(rect.minY)))
-                try await scanner.set("br-x", to: .int(Int(rect.maxX)))
-                try await scanner.set("br-y", to: .int(Int(rect.maxY)))
-                options = try await scanner.options()
+                for (name, value) in settings { try await scanner.set(name, to: value) }
                 note("Scan area \(Int(rect.minX)),\(Int(rect.minY)) – \(Int(rect.maxX)),\(Int(rect.maxY)) mm")
             } catch {
                 fail("Could not set scan area", error)
             }
+            await reloadOptions()
         }
     }
 
@@ -239,51 +274,57 @@ final class ScannerModel {
         setArea(CGRect(origin: .zero, size: bedSize))
     }
 
+    private func reloadOptions() async {
+        do {
+            options = try await scanner.options()
+        } catch {
+            fail("Could not read the scanner's options", error)
+        }
+    }
+
     // MARK: Scanning
 
     /// Whole bed at the lowest resolution, 8-bit, then every option put back as it was.
     func preview() {
-        guard canScan else { return }
+        guard begin(.preview) else { return }
         Task {
-            let saved = options.filter { ["resolution", "depth", "tl-x", "tl-y", "br-x", "br-y"].contains($0.name) }
+            var saved: [ScanOption] = []
             do {
-                let lowest = options.first { $0.name == "resolution" }.flatMap { option -> Int? in
-                    if case .intList(let values) = option.constraint { return values.min() }
-                    return nil
-                } ?? 50
-                try await scanner.set("resolution", to: .int(lowest))
-                try await scanner.set("depth", to: .int(8))
-                try await scanner.set("tl-x", to: .int(0))
-                try await scanner.set("tl-y", to: .int(0))
-                try await scanner.set("br-x", to: .int(Int(bedSize.width)))
-                try await scanner.set("br-y", to: .int(Int(bedSize.height)))
+                // Read back from the backend rather than `options`, which can lag a set() that
+                // is still queued on the scanner; restoring from a stale copy would undo it.
+                let current = try await scanner.options()
+                let overrides = previewOverrides(given: current)
+                saved = current.filter { option in overrides.contains { $0.name == option.name } }
+                for (name, value) in overrides { try await scanner.set(name, to: value) }
                 let frame = try await run(.preview)
+                previewBedSize = bedSize
                 previewImage = frame.cgImage
                 canvasMode = .preview
             } catch is CancellationError {
                 note("Preview cancelled")
             } catch {
-                fail("Preview failed", error)
+                await failScan("Preview failed", error)
             }
-            await restore(saved)
-            activity = .idle
+            if !saved.isEmpty { await restore(saved) }
+            finish()
         }
     }
 
     func scan() {
-        guard canScan else { return }
+        guard begin(.final) else { return }
         Task {
             do {
                 let frame = try await run(.final)
+                // Both assignments render once: the didSets coalesce into one pass.
+                balanceResult = isFilmSource
                 result = frame
-                balanceResult = isFilmSource   // Its didSet renders the result.
                 canvasMode = .result
             } catch is CancellationError {
                 note("Scan cancelled")
             } catch {
-                fail("Scan failed", error)
+                await failScan("Scan failed", error)
             }
-            activity = .idle
+            finish()
         }
     }
 
@@ -297,10 +338,22 @@ final class ScannerModel {
         activity = .cancelling(kind)
     }
 
-    private func run(_ kind: ScanKind) async throws -> ScanFrame {
+    /// Claims the scanner synchronously, so nothing else can start a scan while the preview is
+    /// still changing options on the actor, and Cancel is honoured from this point on.
+    private func begin(_ kind: ScanKind) -> Bool {
+        guard canScan else { return false }
         scanner.clearCancel()
         activity = .warmingUp(kind)
         errorMessage = nil
+        return true
+    }
+
+    private func finish() {
+        if activity != .disconnected { activity = .idle }
+    }
+
+    private func run(_ kind: ScanKind) async throws -> ScanFrame {
+        if case .cancelling = activity { throw CancellationError() }   // Cancelled during setup.
         let started = Date()
         note(kind == .preview ? "Preview started" : "Scan started: \(settingsSummary)")
         let frame = try await scanner.scan { done, total in
@@ -311,7 +364,7 @@ final class ScannerModel {
         }
         let seconds = Date().timeIntervalSince(started)
         note(String(format: "%@ finished: %d×%d px, %d-bit, %d channel(s), %.1f MB in %.0f s",
-                    kind == .preview ? "Preview" : "Scan", frame.width, frame.height, frame.depth,
+                    kind.rawValue, frame.width, frame.height, frame.depth,
                     frame.channels, Double(frame.pixels.count) / 1_048_576, seconds))
         if frame.height < frame.announcedHeight {
             note("Scanner stopped early: delivered \(frame.height) of \(frame.announcedHeight) lines")
@@ -319,49 +372,93 @@ final class ScannerModel {
         return frame
     }
 
+    private func failScan(_ context: String, _ error: Error) async {
+        fail(context, error)
+        if let sane = error as? SaneError, sane.isDeviceLost { await lostScanner() }
+    }
+
+    /// Lowest resolution, 8-bit, whole bed — for the options this backend has.
+    private func previewOverrides(given current: [ScanOption]) -> [(name: String, value: OptionValue)] {
+        let lowest = current.first { $0.name == "resolution" }.flatMap { option -> Int? in
+            if case .intList(let values) = option.constraint { return values.min() }
+            return nil
+        } ?? 50
+        let bed = CGRect(origin: .zero, size: bedSize)
+        let overrides: [(name: String, value: OptionValue)] =
+            [(name: "resolution", value: .int(lowest)), (name: "depth", value: .int(8))] + geometrySettings(for: bed)
+        return overrides.filter { override in current.contains { $0.name == override.name } }
+    }
+
     private func restore(_ saved: [ScanOption]) async {
         do {
             for option in saved {
                 if let value = option.value { try await scanner.set(option.name, to: value) }
             }
-            options = try await scanner.options()
         } catch {
             fail("Could not restore settings after preview", error)
         }
+        await reloadOptions()
     }
 
     /// True when the current source option is the transparency adapter (Negative or Slide).
     private var isFilmSource: Bool {
         if case .string(let source)? = options.first(where: { $0.name == "source" })?.value {
-            return source != "Flatbed"
+            return ["Negative", "Slide"].contains(source)
         }
         return false
     }
 
-    /// The scan with the toolbar toggles applied; what the canvas shows and Save writes.
-    private var processedResult: ScanFrame? {
-        guard var frame = result else { return nil }
-        if invertResult { frame = frame.inverted() }
-        if balanceResult { frame = frame.balanced() }
-        return frame
+    // MARK: Rendering
+
+    /// Runs the toggles over `result` once per main-actor turn, off the main actor: a full-bed
+    /// 16-bit frame takes seconds to balance and would otherwise freeze the window.
+    private func scheduleRender() {
+        guard !renderScheduled else { return }
+        renderScheduled = true
+        Task { @MainActor in
+            renderScheduled = false
+            render()
+        }
     }
 
-    private func refreshResultImage() {
-        resultImage = processedResult?.cgImage
+    private func render() {
+        renderTask?.cancel()
+        guard let result else {
+            processedResult = nil
+            resultImage = nil
+            isProcessing = false
+            return
+        }
+        let invert = invertResult, balance = balanceResult
+        isProcessing = true
+        renderTask = Task {
+            let frame = await Task.detached(priority: .userInitiated) {
+                result.processed(invert: invert, balance: balance)
+            }.value
+            let image = await Task.detached(priority: .userInitiated) { frame.displayImage() }.value
+            guard !Task.isCancelled else { return }
+            processedResult = frame
+            resultImage = image
+            isProcessing = false
+        }
     }
 
     // MARK: Saving
 
     func save() {
-        guard let result = processedResult else { return }
+        guard let processedResult else { return }
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.png, .tiff, .jpeg]
-        panel.nameFieldStringValue = "Scan " + Date().formatted(.dateTime.year().month().day().hour().minute()) + ".png"
+        // No colon: macOS shows it as "/" in file names.
+        let stamp = Date().formatted(Date.VerbatimFormatStyle(
+            format: "\(year: .defaultDigits)-\(month: .twoDigits)-\(day: .twoDigits) \(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased)).\(minute: .twoDigits)",
+            timeZone: .current, calendar: .current))
+        panel.nameFieldStringValue = "Scan \(stamp).png"
         panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let url = panel.url else { return }
         let type = UTType(filenameExtension: url.pathExtension) ?? .png
         do {
-            try result.write(to: url, as: type)
+            try processedResult.write(to: url, as: type)
             note("Saved \(url.lastPathComponent)")
         } catch {
             fail("Could not save", error)
@@ -370,16 +467,28 @@ final class ScannerModel {
 
     // MARK: Front-panel buttons
 
-    /// Polls the scanner's buttons while idle; any press starts a scan, like the original software.
+    /// Polls the scanner's buttons while idle; a press starts a scan, like the original software.
+    /// Edge-triggered: a button that reads as held (hp3900 reports every button pressed once the
+    /// USB link is gone) starts one scan, not one per poll.
     private func startWatchingButtons() {
         sensorTask?.cancel()
         sensorTask = Task {
+            var held: Set<String> = []
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(500))
                 guard canScan else { continue }
-                guard let states = try? await scanner.sensors(),
-                      let pressed = states.first(where: { $0.value })?.key else { continue }
-                note("Scanner button “\(pressed)” pressed")
+                let states: [String: Bool]
+                do {
+                    states = try await scanner.sensors()
+                } catch {
+                    fail("Could not read the scanner's buttons", error)
+                    await lostScanner()
+                    return
+                }
+                let pressed = Set(states.filter(\.value).keys)
+                defer { held = pressed }
+                guard let name = pressed.subtracting(held).first else { continue }
+                note("Scanner button “\(name)” pressed")
                 scan()
             }
         }
@@ -387,12 +496,24 @@ final class ScannerModel {
 
     // MARK: Helpers
 
-    private func intValue(_ name: String) -> Int {
-        if case .int(let value)? = options.first(where: { $0.name == name })?.value { return value }
-        return 0
+    /// The geometry options for `rect`, origin first so the far edge never has to be below it,
+    /// each in the type the backend declares (hp3900 uses whole millimetres, most use fixed-point).
+    private func geometrySettings(for rect: CGRect) -> [(name: String, value: OptionValue)] {
+        [("tl-x", rect.minX), ("tl-y", rect.minY), ("br-x", rect.maxX), ("br-y", rect.maxY)].map { name, millimetres in
+            let kind = options.first { $0.name == name }?.kind
+            return (name, kind == .fixed ? .fixed(Double(millimetres)) : .int(Int(millimetres)))
+        }
     }
 
-    private func maxValue(_ name: String) -> Int {
+    private func number(_ name: String) -> Double {
+        switch options.first(where: { $0.name == name })?.value {
+        case .int(let value)?: Double(value)
+        case .fixed(let value)?: value
+        default: 0
+        }
+    }
+
+    private func maximum(_ name: String) -> Double {
         if case .range(_, let max, _)? = options.first(where: { $0.name == name })?.constraint { return max }
         return 0
     }

@@ -38,7 +38,7 @@ struct ContentView: View {
                         Toggle("Balance", systemImage: "slider.horizontal.3", isOn: $model.balanceResult)
                             .disabled(model.result == nil)
                         Button("Save…", systemImage: "square.and.arrow.down") { model.save() }
-                            .disabled(model.result == nil)
+                            .disabled(!model.canSave)
                         Toggle("Log", systemImage: "list.bullet.rectangle", isOn: $showLog)
                     }
                 }
@@ -70,6 +70,9 @@ private struct SettingsSidebar: View {
                     }
                     Button("Use whole bed as scan area") { model.selectWholeBed() }
                     Toggle("Show advanced options", isOn: $model.showAdvanced)
+                    // hp3900 cannot tell an unplugged scanner from a bad setting, so the way
+                    // back after a USB hiccup has to be reachable while "connected".
+                    Button("Reconnect") { Task { await model.connect() } }
                 } else {
                     LabeledContent("Scanner") {
                         Text(model.activity == .connecting ? "Connecting…" : "Not connected")
@@ -126,7 +129,7 @@ private struct OptionRow: View {
                             .labelsHidden()
                             .frame(width: 64)
                             .multilineTextAlignment(.trailing)
-                        Stepper(option.unit, value: binding(current) { .int($0) }, in: low...high, step: max(step, 1))
+                        Stepper(option.unit, value: binding(current) { .int($0) }, in: Int(low)...Int(high), step: max(Int(step), 1))
                     }
                 }
             case (.int, _, .int(let current)):
@@ -282,27 +285,30 @@ private struct StatusBar: View {
             case .connecting:
                 ProgressView().controlSize(.small)
                 Text("Connecting…")
+            case .idle where model.isProcessing:
+                ProgressView().controlSize(.small)
+                Text("Processing scan…")
             case .idle:
                 Label(areaSummary, systemImage: "rectangle.dashed")
             case .warmingUp(let kind):
                 ProgressView().controlSize(.small)
-                Text(kind == .preview ? "Preview: warming up lamp…" : "Scan: warming up lamp…")
+                Text("\(kind.rawValue): warming up lamp…")
             case .reading(let kind, let done, let total):
                 if total > 0, done >= total {
                     // Every line is in; the backend's final read only returns once it has
                     // stopped the scanner, and it reports nothing during that.
                     ProgressView().controlSize(.small)
-                    Text("\(kind == .preview ? "Preview" : "Scan"): all \(total) lines received, waiting for scanner…")
+                    Text("\(kind.rawValue): all \(total) lines received, waiting for scanner…")
                 } else if total > 0 {
                     ProgressView(value: Double(done), total: Double(total)).frame(width: 180)
-                    Text("\(kind == .preview ? "Preview" : "Scan"): line \(done) of \(total)")
+                    Text("\(kind.rawValue): line \(done) of \(total)")
                 } else {
                     ProgressView().controlSize(.small)
-                    Text("\(kind == .preview ? "Preview" : "Scan"): line \(done)")
+                    Text("\(kind.rawValue): line \(done)")
                 }
             case .cancelling(let kind):
                 ProgressView().controlSize(.small)
-                Text(kind == .preview ? "Cancelling preview…" : "Cancelling scan…")
+                Text("Cancelling \(kind.rawValue.lowercased())…")
             }
             Spacer()
             if let message = model.errorMessage {

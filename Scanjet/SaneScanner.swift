@@ -9,15 +9,19 @@ nonisolated struct SaneError: LocalizedError {
     var errorDescription: String? {
         "\(context): \(String(cString: sane_strstatus(status)))"
     }
+
+    /// The backend could not talk to the hardware; the scanner is as good as unplugged.
+    var isDeviceLost: Bool { status == SANE_STATUS_IO_ERROR }
 }
 
 nonisolated enum OptionKind: Sendable, Equatable {
     case bool, int, fixed, string, button, group
 }
 
+/// Limits in the option's own units: whole numbers for `.int`, real values for `.fixed`.
 nonisolated enum OptionConstraint: Sendable, Equatable {
     case none
-    case range(min: Int, max: Int, step: Int)
+    case range(min: Double, max: Double, step: Double)
     case intList([Int])
     case stringList([String])
 }
@@ -94,23 +98,26 @@ actor SaneScanner {
         disconnect()
         var version: SANE_Int = 0
         try check(sane_init(&version, nil), "sane_init")
-
-        var list: UnsafeMutablePointer<UnsafePointer<SANE_Device>?>?
-        try check(sane_get_devices(&list, SANE_FALSE), "sane_get_devices")
-        guard let first = list?.pointee?.pointee else {
+        do {
+            var list: UnsafeMutablePointer<UnsafePointer<SANE_Device>?>?
+            try check(sane_get_devices(&list, SANE_FALSE), "sane_get_devices")
+            guard let first = list?.pointee?.pointee else {
+                throw SaneError(status: SANE_STATUS_NO_DOCS, context: "No scanner found")
+            }
+            let info = DeviceInfo(
+                name: String(cString: first.name),
+                vendor: String(cString: first.vendor),
+                model: String(cString: first.model)
+            )
+            var opened: SANE_Handle?
+            try check(sane_open(info.name, &opened), "sane_open \(info.name)")
+            handle = opened
+            return info
+        } catch {
+            // Every sane_init needs its sane_exit, or the next connect() initialises twice.
             sane_exit()
-            throw SaneError(status: SANE_STATUS_NO_DOCS, context: "No scanner found")
+            throw error
         }
-        let info = DeviceInfo(
-            name: String(cString: first.name),
-            vendor: String(cString: first.vendor),
-            model: String(cString: first.model)
-        )
-
-        var opened: SANE_Handle?
-        try check(sane_open(info.name, &opened), "sane_open \(info.name)")
-        handle = opened
-        return info
     }
 
     func disconnect() {
@@ -124,18 +131,19 @@ actor SaneScanner {
 
     func options() throws -> [ScanOption] {
         let handle = try openHandle()
-        var count: SANE_Int = 0
-        try check(sane_control_option(handle, 0, SANE_ACTION_GET_VALUE, &count, nil), "option count")
-        return try (1..<count).compactMap { try option(at: $0, handle: handle) }
+        return try descriptors(handle).map { option in
+            var option = option
+            option.value = try value(of: option, handle: handle)
+            return option
+        }
     }
 
-    /// Sets one option. Returns true when the backend says other options may have changed.
-    @discardableResult
-    func set(_ name: String, to value: OptionValue) throws -> Bool {
+    /// Sets one option, clamped to its constraint the way SANE's own `sanei_constrain_value`
+    /// does: hp3900 stores whatever it is given, so an out-of-range value would otherwise be
+    /// accepted and then fail every scan.
+    func set(_ name: String, to value: OptionValue) throws {
         let handle = try openHandle()
-        guard let option = try options().first(where: { $0.name == name }) else {
-            throw SaneError(status: SANE_STATUS_INVAL, context: "No option named \(name)")
-        }
+        let option = try descriptor(named: name, handle: handle)
         var info: SANE_Int = 0
         let status: SANE_Status
         switch (option.kind, value) {
@@ -143,10 +151,10 @@ actor SaneScanner {
             var word: SANE_Word = flag ? SANE_TRUE : SANE_FALSE
             status = sane_control_option(handle, option.index, SANE_ACTION_SET_VALUE, &word, &info)
         case (.int, .int(let number)):
-            var word = SANE_Word(number)
+            var word = try Self.word(Double(Self.constrain(Double(number), to: option.constraint)), for: name)
             status = sane_control_option(handle, option.index, SANE_ACTION_SET_VALUE, &word, &info)
         case (.fixed, .fixed(let number)):
-            var word = SANE_Word((number * 65536).rounded())
+            var word = try Self.word(Self.constrain(number, to: option.constraint) * 65536, for: name)
             status = sane_control_option(handle, option.index, SANE_ACTION_SET_VALUE, &word, &info)
         case (.string, .string(let text)):
             // The backend may rewrite the buffer with the value it actually applied.
@@ -157,23 +165,26 @@ actor SaneScanner {
             throw SaneError(status: SANE_STATUS_INVAL, context: "\(name) does not take \(value)")
         }
         try check(status, "set \(name)")
-        return info & SANE_INFO_RELOAD_OPTIONS != 0
     }
 
     func press(_ name: String) throws {
         let handle = try openHandle()
-        guard let option = try options().first(where: { $0.name == name }), option.kind == .button else {
-            throw SaneError(status: SANE_STATUS_INVAL, context: "No button named \(name)")
+        let option = try descriptor(named: name, handle: handle)
+        guard option.kind == .button else {
+            throw SaneError(status: SANE_STATUS_INVAL, context: "\(name) is not a button")
         }
         var ignored: SANE_Word = 0
         try check(sane_control_option(handle, option.index, SANE_ACTION_SET_VALUE, &ignored, nil), "press \(name)")
     }
 
-    /// Current state of every hardware sensor (front-panel buttons), by option name.
+    /// Current state of every hardware sensor (front-panel buttons), by option name. Reads only
+    /// the sensors: on hp3900 every button read clears the press, so sweeping all options here
+    /// would swallow presses.
     func sensors() throws -> [String: Bool] {
+        let handle = try openHandle()
         var states: [String: Bool] = [:]
-        for option in try options() where option.isSensor && option.isActive {
-            if case .bool(let pressed) = option.value { states[option.name] = pressed }
+        for option in try descriptors(handle) where option.isSensor && option.isActive && option.kind == .bool {
+            if case .bool(let pressed)? = try value(of: option, handle: handle) { states[option.name] = pressed }
         }
         return states
     }
@@ -184,15 +195,16 @@ actor SaneScanner {
     /// total is 0 while the backend does not know it yet.
     func scan(progress: @escaping @Sendable (Int, Int) -> Void) throws -> ScanFrame {
         let handle = try openHandle()
-        try check(sane_start(handle), "sane_start")
         defer {
             // hp3900's sane_cancel only raises a flag; the actual stop (park the carriage, arm the
             // lamp timer) runs on the next sane_read. A scan that ends on the backend's error path
-            // skips that stop, so always give it one more read to do it.
+            // skips that stop — including sane_start failing after it has already moved the head
+            // — so always give it one more read to do it. Both are no-ops when nothing started.
             sane_cancel(handle)
             var length: SANE_Int = 0
             _ = sane_read(handle, &chunk, SANE_Int(chunk.count), &length)
         }
+        try check(sane_start(handle), "sane_start")
         if cancelRequested.load(ordering: .acquiring) { sane_cancel(handle) }
 
         var params = SANE_Parameters()
@@ -205,6 +217,9 @@ actor SaneScanner {
             throw SaneError(status: SANE_STATUS_UNSUPPORTED, context: "Three-pass colour frames")
         }
         let bytesPerLine = Int(params.bytes_per_line)
+        guard bytesPerLine > 0 else {
+            throw SaneError(status: SANE_STATUS_INVAL, context: "Backend reported an empty scan line")
+        }
         let knownLines = Int(params.lines)
         var pixels = Data()
         if knownLines > 0 { pixels.reserveCapacity(bytesPerLine * knownLines) }
@@ -267,8 +282,45 @@ actor SaneScanner {
         guard status == SANE_STATUS_GOOD else { throw SaneError(status: status, context: context) }
     }
 
-    private func option(at index: SANE_Int, handle: SANE_Handle) throws -> ScanOption? {
-        guard let descriptor = sane_get_option_descriptor(handle, index)?.pointee else { return nil }
+    /// Every option's descriptor, values not yet read. Pure memory reads, no device traffic.
+    private func descriptors(_ handle: SANE_Handle) throws -> [ScanOption] {
+        var count: SANE_Int = 0
+        try check(sane_control_option(handle, 0, SANE_ACTION_GET_VALUE, &count, nil), "option count")
+        return (1..<max(count, 1)).compactMap { index in
+            sane_get_option_descriptor(handle, index).map { Self.option(from: $0.pointee, at: index) }
+        }
+    }
+
+    private func descriptor(named name: String, handle: SANE_Handle) throws -> ScanOption {
+        guard let option = try descriptors(handle).first(where: { $0.name == name }) else {
+            throw SaneError(status: SANE_STATUS_INVAL, context: "No option named \(name)")
+        }
+        return option
+    }
+
+    private func value(of option: ScanOption, handle: SANE_Handle) throws -> OptionValue? {
+        guard option.isActive else { return nil }
+        switch option.kind {
+        case .bool, .int, .fixed:
+            // Array-valued options (gamma tables, size > one word) are not exposed in the UI.
+            guard option.size == MemoryLayout<SANE_Word>.size else { return nil }
+            var word: SANE_Word = 0
+            try check(sane_control_option(handle, option.index, SANE_ACTION_GET_VALUE, &word, nil), "get \(option.name)")
+            switch option.kind {
+            case .bool: return .bool(word != SANE_FALSE)
+            case .int: return .int(Int(word))
+            default: return .fixed(Double(word) / 65536)
+            }
+        case .string:
+            var buffer = [CChar](repeating: 0, count: option.size)
+            try check(sane_control_option(handle, option.index, SANE_ACTION_GET_VALUE, &buffer, nil), "get \(option.name)")
+            return .string(buffer.withUnsafeBufferPointer { String(cString: $0.baseAddress!) })
+        case .button, .group:
+            return nil
+        }
+    }
+
+    private static func option(from descriptor: SANE_Option_Descriptor, at index: SANE_Int) -> ScanOption {
         let kind: OptionKind
         switch descriptor.type {
         case SANE_TYPE_BOOL: kind = .bool
@@ -279,55 +331,54 @@ actor SaneScanner {
         default: kind = .group
         }
         let cap = descriptor.cap
-        let isActive = cap & SANE_CAP_INACTIVE == 0
         let isSettable = cap & SANE_CAP_SOFT_SELECT != 0
-        let isSensor = cap & SANE_CAP_SOFT_DETECT != 0 && !isSettable
-        let isWord = descriptor.size == MemoryLayout<SANE_Word>.size
-
-        var value: OptionValue?
-        if isActive {
-            switch kind {
-            case .bool, .int, .fixed:
-                // Array-valued options (gamma tables, size > one word) are not exposed in the UI.
-                guard isWord else { break }
-                var word: SANE_Word = 0
-                try check(sane_control_option(handle, index, SANE_ACTION_GET_VALUE, &word, nil), "get option \(index)")
-                switch kind {
-                case .bool: value = .bool(word != SANE_FALSE)
-                case .int: value = .int(Int(word))
-                default: value = .fixed(Double(word) / 65536)
-                }
-            case .string:
-                var buffer = [CChar](repeating: 0, count: Int(descriptor.size))
-                try check(sane_control_option(handle, index, SANE_ACTION_GET_VALUE, &buffer, nil), "get option \(index)")
-                value = .string(buffer.withUnsafeBufferPointer { String(cString: $0.baseAddress!) })
-            case .button, .group:
-                break
-            }
-        }
-
         return ScanOption(
             index: index,
             name: descriptor.name.map { String(cString: $0) } ?? "",
             title: descriptor.title.map { String(cString: $0) } ?? "",
             detail: descriptor.desc.map { String(cString: $0) } ?? "",
             kind: kind,
-            unit: Self.unitLabel(descriptor.unit),
-            constraint: Self.constraint(of: descriptor),
-            isActive: isActive,
+            unit: unitLabel(descriptor.unit),
+            constraint: constraint(of: descriptor, kind: kind),
+            isActive: cap & SANE_CAP_INACTIVE == 0,
             isSettable: isSettable,
             isAdvanced: cap & SANE_CAP_ADVANCED != 0,
-            isSensor: isSensor,
+            isSensor: cap & SANE_CAP_SOFT_DETECT != 0 && !isSettable,
             size: Int(descriptor.size),
-            value: value
+            value: nil
         )
     }
 
-    private static func constraint(of descriptor: SANE_Option_Descriptor) -> OptionConstraint {
+    /// A SANE word from an already-constrained number; what's left over is a backend whose
+    /// range itself overflows, or an unconstrained option fed an absurd value.
+    private static func word(_ number: Double, for name: String) throws -> SANE_Word {
+        guard let word = SANE_Word(exactly: number.rounded()) else {
+            throw SaneError(status: SANE_STATUS_INVAL, context: "\(name) cannot take \(number.formatted())")
+        }
+        return word
+    }
+
+    /// Clamps to a range (rounded to its step) or snaps to the nearest listed value.
+    private static func constrain(_ number: Double, to constraint: OptionConstraint) -> Double {
+        switch constraint {
+        case .range(let low, let high, let step):
+            let clamped = min(max(number, low), high)
+            guard step > 0 else { return clamped }
+            return min(low + ((clamped - low) / step).rounded() * step, high)
+        case .intList(let values):
+            return values.min { abs(Double($0) - number) < abs(Double($1) - number) }.map(Double.init) ?? number
+        case .none, .stringList:
+            return number
+        }
+    }
+
+    private static func constraint(of descriptor: SANE_Option_Descriptor, kind: OptionKind) -> OptionConstraint {
+        // Fixed-point options keep their limits as 16.16 words; report them in real units.
+        let scale: Double = kind == .fixed ? 65536 : 1
         switch descriptor.constraint_type {
         case SANE_CONSTRAINT_RANGE:
             guard let range = descriptor.constraint.range?.pointee else { return .none }
-            return .range(min: Int(range.min), max: Int(range.max), step: Int(range.quant))
+            return .range(min: Double(range.min) / scale, max: Double(range.max) / scale, step: Double(range.quant) / scale)
         case SANE_CONSTRAINT_WORD_LIST:
             guard let list = descriptor.constraint.word_list else { return .none }
             let count = Int(list[0])
