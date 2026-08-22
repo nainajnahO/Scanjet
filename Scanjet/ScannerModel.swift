@@ -305,7 +305,7 @@ final class ScannerModel {
             } catch {
                 await failScan("Preview failed", error)
             }
-            if !saved.isEmpty { await restore(saved) }
+            if !saved.isEmpty, activity != .disconnected { await restore(saved) }
             finish()
         }
     }

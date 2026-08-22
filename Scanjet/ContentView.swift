@@ -33,10 +33,12 @@ struct ContentView: View {
                             Button("Scan", systemImage: "scanner") { model.scan() }
                                 .disabled(!model.canScan)
                         }
+                        // Off while processing: a cancelled render keeps computing, so a second
+                        // one on top of it would double the memory of a large frame.
                         Toggle("Invert", systemImage: "circle.lefthalf.filled", isOn: $model.invertResult)
-                            .disabled(model.result == nil)
+                            .disabled(!model.canSave)
                         Toggle("Balance", systemImage: "slider.horizontal.3", isOn: $model.balanceResult)
-                            .disabled(model.result == nil)
+                            .disabled(!model.canSave)
                         Button("Save…", systemImage: "square.and.arrow.down") { model.save() }
                             .disabled(!model.canSave)
                         Toggle("Log", systemImage: "list.bullet.rectangle", isOn: $showLog)
