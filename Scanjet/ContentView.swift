@@ -71,6 +71,10 @@ private struct SettingsSidebar: View {
                         }
                     }
                     Button("Use whole bed as scan area") { model.selectWholeBed() }
+                    Picker("Film on flatbed", selection: $model.flatbedFilm) {
+                        ForEach(ScannerModel.FlatbedFilm.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    .help("Film laid on the glass and lit from above, scanned with the Flatbed source over any area. Negative: Invert and Balance after the scan; Slide: Balance. The Negative and Slide sources are limited to the lid's backlight window.")
                     Toggle("Show advanced options", isOn: $model.showAdvanced)
                     // hp3900 cannot tell an unplugged scanner from a bad setting, so the way
                     // back after a USB hiccup has to be reachable while "connected".

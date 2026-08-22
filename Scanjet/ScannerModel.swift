@@ -40,9 +40,20 @@ final class ScannerModel {
         var id: String { title }
     }
 
+    /// Film laid on the glass and lit from above, scanned with the Flatbed source. The backend's
+    /// Negative/Slide sources are hard-cropped to the lid backlight window (45 mm wide on the
+    /// G3010), so freehand film has to go through Flatbed and be processed here instead.
+    enum FlatbedFilm: String, CaseIterable, Identifiable {
+        case none = "None"
+        case negative = "Negative"
+        case slide = "Slide"
+        var id: String { rawValue }
+    }
+
     struct Preset: Identifiable {
         let name: String
         let settings: [(option: String, value: OptionValue)]
+        var film = FlatbedFilm.none
         var id: String { name }
     }
 
@@ -64,6 +75,14 @@ final class ScannerModel {
             ("source", .string("Slide")), ("mode", .string("Color")), ("resolution", .int(2400)), ("depth", .int(16)),
             ("opt_nogamma", .bool(false)), ("opt_nowshading", .bool(false)),
         ]),
+        Preset(name: "Negative on flatbed", settings: [
+            ("source", .string("Flatbed")), ("mode", .string("Color")), ("resolution", .int(2400)), ("depth", .int(16)),
+            ("opt_nogamma", .bool(false)), ("opt_nowshading", .bool(false)),
+        ], film: .negative),
+        Preset(name: "Slide on flatbed", settings: [
+            ("source", .string("Flatbed")), ("mode", .string("Color")), ("resolution", .int(2400)), ("depth", .int(16)),
+            ("opt_nogamma", .bool(false)), ("opt_nowshading", .bool(false)),
+        ], film: .slide),
         // What the sensor saw: no gamma curve, no white-shading correction, 16-bit samples.
         Preset(name: "Raw sensor", settings: [
             ("mode", .string("Color")), ("depth", .int(16)),
@@ -105,6 +124,8 @@ final class ScannerModel {
         didSet { scheduleRender() }
     }
     var showAdvanced = false
+    /// What a Flatbed scan is of; decides the Invert/Balance defaults after each scan.
+    var flatbedFilm = FlatbedFilm.none
     /// Which image the canvas shows; flips automatically when a preview or scan completes.
     var canvasMode: CanvasMode = .preview
 
@@ -241,6 +262,7 @@ final class ScannerModel {
 
     func apply(_ preset: Preset) {
         let available = Set(options.map(\.name))
+        flatbedFilm = preset.film
         Task {
             do {
                 for setting in preset.settings where available.contains(setting.option) {
@@ -315,8 +337,19 @@ final class ScannerModel {
         Task {
             do {
                 let frame = try await run(.final)
-                // Both assignments render once: the didSets coalesce into one pass.
-                balanceResult = isFilmSource
+                // The assignments render once: the didSets coalesce into one pass.
+                switch (isFilmSource, flatbedFilm) {
+                case (true, _):
+                    balanceResult = true   // The backend already inverted a negative.
+                case (false, .negative):
+                    invertResult = true
+                    balanceResult = true
+                case (false, .slide):
+                    invertResult = false
+                    balanceResult = true
+                case (false, .none):
+                    balanceResult = false
+                }
                 result = frame
                 canvasMode = .result
             } catch is CancellationError {
@@ -519,9 +552,10 @@ final class ScannerModel {
     }
 
     private var settingsSummary: String {
-        ["source", "mode", "resolution", "depth"]
+        let settings = ["source", "mode", "resolution", "depth"]
             .compactMap { name in options.first { $0.name == name }?.value.map(describe) }
-            .joined(separator: ", ")
+        let film = flatbedFilm == .none || isFilmSource ? [] : ["\(flatbedFilm.rawValue.lowercased()) on flatbed"]
+        return (settings + film).joined(separator: ", ")
     }
 
     private func describe(_ value: OptionValue) -> String {

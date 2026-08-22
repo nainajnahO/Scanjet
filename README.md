@@ -33,6 +33,7 @@ Open `Scanjet.xcodeproj` in Xcode and run the `Scanjet` scheme (⌘R).
 - The canvas shows a display-sized copy of the scan; Save writes the full-resolution frame.
 - Presets set source/mode/resolution/depth; **Raw sensor** turns off gamma and white-shading correction. A preset only touches the options the connected backend has.
 - Changing the source between flatbed and the film adapter changes the bed size, so the preview is discarded and the area has to be picked again.
+- The **Negative** and **Slide** sources are limited to the lid's backlight window — on the G3010 a 45 mm strip at x ≈ 89 mm, 85 mm (negatives) or 100 mm (slides) tall. That is the backend's doing (`Constrains_Check` in `hp3900`), not the app's, and the lid only lights that strip anyway. For film anywhere on the glass, lit by a panel on top, use the **Flatbed** source and set **Film on flatbed** in the sidebar to Negative (Invert + Balance after the scan) or Slide (Balance); the **Negative on flatbed** / **Slide on flatbed** presets do that together with 2400 dpi, 16-bit. Any area can be selected as usual.
 - Quitting mid-scan cancels the scan and waits for the backend to park the carriage before the app exits.
 - **Show advanced options** exposes everything the backend has (warm-up, shading, gamma, debug images, chip info).
 - The **Log** inspector records every option change and scan with timings.
