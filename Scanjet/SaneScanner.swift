@@ -144,6 +144,11 @@ actor SaneScanner {
     func set(_ name: String, to value: OptionValue) throws {
         let handle = try openHandle()
         let option = try descriptor(named: name, handle: handle)
+        // Array-valued options (gamma tables) take a whole table; writing one word would make
+        // the backend read 256 KB off a 4-byte stack slot.
+        if [.bool, .int, .fixed].contains(option.kind), option.size != MemoryLayout<SANE_Word>.size {
+            throw SaneError(status: SANE_STATUS_UNSUPPORTED, context: "\(name) is array-valued")
+        }
         var info: SANE_Int = 0
         let status: SANE_Status
         switch (option.kind, value) {
