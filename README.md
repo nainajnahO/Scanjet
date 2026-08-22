@@ -32,13 +32,44 @@ Open `Scanjet.xcodeproj` in Xcode and run the `Scanjet` scheme (⌘R).
 - **Balance** applies per-channel levels plus a grey-world gamma, which removes the orange-mask cast of negative film. Switched on automatically when the source was Negative or Slide. Invert runs first, then Balance; both apply to the canvas and to Save. The processing runs in the background — the status bar says "Processing scan…" until the canvas and Save are ready, which takes a while for a large 16-bit scan in a Debug build.
 - The canvas shows a display-sized copy of the scan; Save writes the full-resolution frame.
 - Presets set source/mode/resolution/depth; **Raw sensor** turns off gamma and white-shading correction. A preset only touches the options the connected backend has.
-- Changing the source between flatbed and the film adapter changes the bed size, so the preview is discarded and the area has to be picked again.
+- Changing the source between flatbed and the film adapter changes the bed size when the backend's film window is smaller than the bed (stock `hp3900`, see below), so the preview is discarded and the area has to be picked again.
 - Quitting mid-scan cancels the scan and waits for the backend to park the carriage before the app exits.
 - **Show advanced options** exposes everything the backend has (warm-up, shading, gamma, debug images, chip info).
 - The **Log** inspector records every option change and scan with timings.
 
 The sidebar is generated from the backend's option descriptors, so it reflects whatever scanner is connected.
 Array-valued options (gamma tables) are not exposed.
+
+## Film on the whole bed (patched `hp3900`)
+
+Stock `hp3900` clamps the **Negative** and **Slide** sources to the G3010 lid's backlight window
+— a 45 mm strip at x ≈ 90 mm, 85 mm (negatives) or 100 mm (slides) tall (`cfg_constrains_get`
+in `hp3900_config.c`). With a bigger light on the lid port, such as the HP Scanjet XPA (C9861A),
+that leaves most of the lit area unusable. `Driver/hp3900-g3010-film-window.patch` changes the
+G3010 row so both film sources accept the whole 220 × 300 mm bed; the app then offers the full
+range in the geometry fields and Preview, exactly as for Flatbed.
+
+```sh
+Driver/install-hp3900.sh
+```
+
+The script builds the backend from the sane-backends release Homebrew installed, with the patch
+applied, and replaces `libsane-hp3900.1.so` under `$(brew --prefix sane-backends)/lib/sane`,
+keeping the stock one as `.orig`. `brew upgrade sane-backends` puts the stock backend back — run
+the script again. `brew reinstall sane-backends` undoes it.
+
+How the film lamp behaves, patched or not:
+
+- Only the Negative and Slide sources power the lid port; Flatbed never does, so an adapter on
+  the port stays dark for "Film on flatbed"-style scans and for Preview in the Flatbed source.
+- The driver checks that something is attached to the port before it powers it, and scans fail
+  with "Invalid argument" if nothing is.
+- Calibration for film happens at a fixed spot, y ≈ 70 mm from the top edge, across the columns
+  being scanned. The adapter's lit area must cover that line under every column you select, or
+  those columns get wrong shading gains. Unlit glass scans as solid light grey (the driver inverts
+  negatives).
+- Preview in the Negative source scans the whole bed through the adapter (about 90 s on the
+  G3010), which shows where the lit area and the frames are before a high-resolution scan.
 
 ## Build notes
 
