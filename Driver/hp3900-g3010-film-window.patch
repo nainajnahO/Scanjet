@@ -9,3 +9,19 @@
  		{HPG3110 , {{   0,   220,   0,    300}, {  92,    28,   0,    190}, {  85,    44,   0,    190}}}
  	};
  
+--- a/backend/hp3900_rts8822.c
++++ b/backend/hp3900_rts8822.c
+@@ -8105,6 +8105,13 @@
+ 	   scan.resolution_x) == ERROR)
+ 	return ERROR;
+ 
++      /* The warmup above left the head at the film strip position. Scan
++         coordinates are measured from home, as for reflective scans, so
++         that a film window larger than the lid's cannot run the head past
++         the end of the bed. */
++      if (ypos != 0)
++	Head_ParkHome (dev, TRUE, dev->motorcfg->parkhomemotormove);
++
+       /* Calibration process */
+ 
+       /*592c */

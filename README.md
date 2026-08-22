@@ -45,9 +45,13 @@ Array-valued options (gamma tables) are not exposed.
 Stock `hp3900` clamps the **Negative** and **Slide** sources to the G3010 lid's backlight window
 — a 45 mm strip at x ≈ 90 mm, 85 mm (negatives) or 100 mm (slides) tall (`cfg_constrains_get`
 in `hp3900_config.c`). With a bigger light on the lid port, such as the HP Scanjet XPA (C9861A),
-that leaves most of the lit area unusable. `Driver/hp3900-g3010-film-window.patch` changes the
-G3010 row so both film sources accept the whole 220 × 300 mm bed; the app then offers the full
-range in the geometry fields and Preview, exactly as for Flatbed.
+that leaves most of the lit area unusable. `Driver/hp3900-g3010-film-window.patch` does two
+things: the G3010 row accepts the whole 220 × 300 mm bed for both film sources, and the head is
+parked home after the film lamp warm-up. Stock `hp3900` starts a film scan from the warm-up spot
+(≈ 70 mm down the bed, where the lid's window is) without returning home, so film coordinates
+were relative to that spot — with the wider window alone, a long scan ran the head into the end
+of the bed. With both changes film coordinates are measured from the top edge exactly as for
+Flatbed, and the app offers the full range in the geometry fields and Preview.
 
 ```sh
 Driver/install-hp3900.sh
@@ -64,10 +68,9 @@ How the film lamp behaves, patched or not:
   the port stays dark for "Film on flatbed"-style scans and for Preview in the Flatbed source.
 - The driver checks that something is attached to the port before it powers it, and scans fail
   with "Invalid argument" if nothing is.
-- Calibration for film happens at a fixed spot, y ≈ 70 mm from the top edge, across the columns
-  being scanned. The adapter's lit area must cover that line under every column you select, or
-  those columns get wrong shading gains. Unlit glass scans as solid light grey (the driver inverts
-  negatives).
+- Before a film scan the head moves to y ≈ 70 mm from the top edge to warm the lamp up and wait
+  for it to stabilise; the adapter's lit area should cover that line. Unlit glass scans as solid
+  light grey (the driver inverts negatives).
 - Preview in the Negative source scans the whole bed through the adapter (about 90 s on the
   G3010), which shows where the lit area and the frames are before a high-resolution scan.
 
